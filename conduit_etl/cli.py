@@ -37,6 +37,14 @@ def _setup_logging(cfg: PipelineConfig) -> None:
 # --------------------------------------------------------------------------- #
 
 def _make_catalog(cfg: PipelineConfig):
+    if cfg.catalog.backend == "s3":
+        from conduit_etl.catalog.s3 import S3Catalog
+        return S3Catalog(
+            cfg.catalog.url,
+            endpoint=cfg.catalog.endpoint,
+            key=cfg.catalog.key,
+            secret=cfg.catalog.secret,
+        )
     from conduit_etl.catalog.local import LocalCatalog
     return LocalCatalog(cfg.catalog.path)
 
@@ -46,6 +54,9 @@ def _make_queue(cfg: PipelineConfig):
     if backend == "sqlite":
         from conduit_etl.queue.sqlite import SQLiteQueue
         return SQLiteQueue(cfg.queue.path)
+    if backend == "postgres":
+        from conduit_etl.queue.postgres import PostgresQueue
+        return PostgresQueue(cfg.queue.url)
     from conduit_etl.queue.memory import MemoryQueue
     return MemoryQueue()
 
@@ -454,3 +465,324 @@ def _do_invalidate(step_name: str, cascade: bool, catalog) -> list[str]:
         )
 
     return invalidated
+
+
+# --------------------------------------------------------------------------- #
+# conduit dag
+# --------------------------------------------------------------------------- #
+
+@main.command()
+@click.option("--pipeline", "-p", multiple=True, help="Python module(s) containing your pipeline steps")
+@click.option("--format", "fmt", default="ascii", type=click.Choice(["ascii", "dot"]), help="Output format")
+@click.pass_context
+def dag(ctx: click.Context, pipeline: tuple[str, ...], fmt: str) -> None:
+    """Print the pipeline DAG as ASCII or Graphviz DOT."""
+    for mod in pipeline:
+        try:
+            importlib.import_module(mod)
+        except ImportError as exc:
+            raise click.ClickException(f"cannot import pipeline module {mod!r}: {exc}") from exc
+
+    from conduit_etl.core.registry import get_registry
+    from conduit_etl.core.dag import build_dag, execution_order
+
+    steps = get_registry().all_steps()
+    if not steps:
+        click.echo("No steps registered (pass --pipeline to load your pipeline).")
+        return
+
+    graph = build_dag(steps)
+    by_name = {s.name: s for s in steps}
+
+    if fmt == "dot":
+        lines = ["digraph conduit {", '  rankdir=LR;', '  node [shape=box];']
+        for step in steps:
+            kind = by_name[step.name].kind.value
+            lines.append(f'  "{step.name}" [label="{step.name}\\n({kind})"];')
+        for src, dsts in graph.items():
+            for dst in dsts:
+                lines.append(f'  "{src}" -> "{dst}";')
+        lines.append("}")
+        click.echo("\n".join(lines))
+    else:
+        # ASCII: print level by level
+        levels = execution_order(steps)
+        for i, level in enumerate(levels):
+            click.echo(f"Level {i}:")
+            for s in level:
+                inputs = ", ".join(s.input_names) if s.input_names else "—"
+                downstream = ", ".join(graph.get(s.name, [])) or "—"
+                click.echo(f"  {s.name}  [{s.kind.value}]  in=({inputs})  out=({downstream})")
+
+
+# --------------------------------------------------------------------------- #
+# conduit replay
+# --------------------------------------------------------------------------- #
+
+@main.command()
+@click.argument("step_name")
+@click.option("--run", "run_id", default=None, help="Replay with inputs from a specific run ID")
+@click.option("--pipeline", "-p", multiple=True, help="Python module(s) containing your pipeline steps")
+@click.pass_context
+def replay(ctx: click.Context, step_name: str, run_id: str | None, pipeline: tuple[str, ...]) -> None:
+    """Re-run a step locally using its last recorded inputs (for debugging)."""
+    cfg: PipelineConfig = ctx.obj["cfg"]
+    output: str = ctx.obj["output"]
+
+    for mod in pipeline:
+        try:
+            importlib.import_module(mod)
+        except ImportError as exc:
+            raise click.ClickException(f"cannot import pipeline module {mod!r}: {exc}") from exc
+
+    from conduit_etl.core.registry import get_registry
+    from conduit_etl.executor.local import LocalExecutor
+
+    try:
+        catalog = _make_catalog(cfg)
+        registry = get_registry()
+
+        try:
+            step = registry.get(step_name)
+        except Exception as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        # Find the run to replay
+        if run_id:
+            con = catalog.connection()
+            row = con.execute(
+                "SELECT fingerprint FROM runs.run_records WHERE id = ?", [run_id]
+            ).fetchone()
+            if row is None:
+                raise click.ClickException(f"run {run_id!r} not found")
+            import json as _json
+            fp = _json.loads(row[0])
+        else:
+            last = catalog.last_run(step_name, only_success=True)
+            if last is None:
+                raise click.ClickException(f"no successful run found for {step_name!r}")
+            fp = last.fingerprint
+
+        # Resolve inputs from fingerprint snapshot IDs
+        inputs = {}
+        for name in step.input_names:
+            entry = fp.get(name)
+            if entry and isinstance(entry, list):
+                from conduit_etl.core.models import Snapshot
+                snap_id = entry[0]
+                snap = catalog.latest_snapshot(name)
+                if snap:
+                    inputs[name] = catalog.as_relation(snap)
+
+        staging = cfg.executor.staging_path or cfg.steps.staging_path
+        executor = LocalExecutor(workers=1, staging_path=staging)
+        fut = executor.submit(step, inputs)
+        result = fut.result()
+        executor.shutdown(wait=False)
+        catalog.close()
+    except ConduitError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    _emit({"step": step_name, "rows": result.rows, "duration_seconds": result.duration_seconds,
+           "staging_path": result.staging_path}, output)
+
+
+# --------------------------------------------------------------------------- #
+# conduit backfill
+# --------------------------------------------------------------------------- #
+
+@main.command()
+@click.argument("step_name")
+@click.option("--date", "date_str", required=True, help="Partition date (YYYY-MM-DD)")
+@click.option("--pipeline", "-p", multiple=True, help="Python module(s) containing your pipeline steps")
+@click.pass_context
+def backfill(ctx: click.Context, step_name: str, date_str: str, pipeline: tuple[str, ...]) -> None:
+    """Re-run a step for a specific date partition and commit as a new snapshot."""
+    cfg: PipelineConfig = ctx.obj["cfg"]
+    output: str = ctx.obj["output"]
+
+    for mod in pipeline:
+        try:
+            importlib.import_module(mod)
+        except ImportError as exc:
+            raise click.ClickException(f"cannot import pipeline module {mod!r}: {exc}") from exc
+
+    from conduit_etl.core.registry import get_registry
+    from conduit_etl.executor.local import LocalExecutor
+    from conduit_etl.core.fingerprint import compute_fingerprint
+
+    try:
+        catalog = _make_catalog(cfg)
+        registry = get_registry()
+
+        try:
+            step = registry.get(step_name)
+        except Exception as exc:
+            raise click.ClickException(str(exc)) from exc
+
+        # Resolve full inputs (backfill always runs against current data, filtered by date)
+        inputs = {}
+        for name in step.input_names:
+            snap = catalog.latest_snapshot(name)
+            if snap:
+                rel = catalog.as_relation(snap)
+                # If partition_by is set, filter to the requested date
+                if step.partition_by:
+                    rel = rel.filter(f"{step.partition_by} = '{date_str}'")
+                inputs[name] = rel
+
+        staging = cfg.executor.staging_path or cfg.steps.staging_path
+        executor = LocalExecutor(workers=1, staging_path=staging)
+        fut = executor.submit(step, inputs)
+        result = fut.result()
+        executor.shutdown(wait=False)
+
+        # Commit backfill result to catalog
+        staged = catalog.staged_relation(result.staging_path)
+        fp = compute_fingerprint(step, catalog)
+        fp["__backfill_date__"] = date_str
+        with catalog.transaction() as txn:
+            meta = {"step": step_name, "merge": step.merge.value,
+                    "merge_key": step.merge_key, "backfill_date": date_str}
+            snap = txn.write(step.output_name, staged, meta)
+            txn.commit()
+
+        import uuid as _uuid
+        from datetime import datetime as _dt
+        from conduit_etl.core.models import RunRecord
+        now = _dt.now()
+        catalog.record_run(RunRecord(
+            id=_uuid.uuid4().hex, step_name=step_name, output_table=step.output_name,
+            status="success", snapshot_id=snap.id, fingerprint=fp,
+            rows=result.rows, duration_seconds=result.duration_seconds,
+            started_at=now, finished_at=now, error=None,
+        ))
+        catalog.close()
+    except ConduitError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    _emit({"step": step_name, "date": date_str, "rows": result.rows, "snapshot_id": snap.id}, output)
+
+
+# --------------------------------------------------------------------------- #
+# conduit catalog (subgroup)
+# --------------------------------------------------------------------------- #
+
+@main.group()
+def catalog() -> None:
+    """Catalog management commands."""
+
+
+@catalog.command("snapshots")
+@click.argument("table")
+@click.pass_context
+def catalog_snapshots(ctx: click.Context, table: str) -> None:
+    """List snapshots for a table."""
+    cfg: PipelineConfig = ctx.obj["cfg"]
+    output: str = ctx.obj["output"]
+
+    try:
+        cat = _make_catalog(cfg)
+        from datetime import datetime as _dt, timedelta
+        snaps = cat.snapshots_since(table, _dt(1970, 1, 1))
+        cat.close()
+    except ConduitError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    rows = [{"id": s.id, "table": s.table, "created_at": str(s.created_at),
+             "rows": s.rows, "schema_hash": s.schema_hash} for s in snaps]
+    _emit(rows, output)
+
+
+@catalog.command("diff")
+@click.argument("table")
+@click.argument("snap1")
+@click.argument("snap2")
+@click.pass_context
+def catalog_diff(ctx: click.Context, table: str, snap1: str, snap2: str) -> None:
+    """Show row-level diff between two snapshots of a table."""
+    cfg: PipelineConfig = ctx.obj["cfg"]
+
+    try:
+        cat = _make_catalog(cfg)
+        from conduit_etl.core.models import Snapshot
+        from datetime import datetime as _dt
+
+        s1 = Snapshot(id=snap1, table=table, created_at=_dt.now(), rows=0, schema_hash="")
+        s2 = Snapshot(id=snap2, table=table, created_at=_dt.now(), rows=0, schema_hash="")
+        rel1 = cat.as_relation(s1)
+        rel2 = cat.as_relation(s2)
+
+        added = rel2.except_(rel1)
+        removed = rel1.except_(rel2)
+
+        click.echo(f"=== Added in {snap2} ===")
+        for row in added.fetchall():
+            click.echo(f"  + {row}")
+        click.echo(f"=== Removed in {snap2} ===")
+        for row in removed.fetchall():
+            click.echo(f"  - {row}")
+        cat.close()
+    except ConduitError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@catalog.command("gc")
+@click.option("--older-than", "older_than", default="30d", help="Delete snapshots older than this (e.g. 30d, 7d)")
+@click.option("--dry-run", is_flag=True, default=False, help="Show what would be deleted without deleting")
+@click.pass_context
+def catalog_gc(ctx: click.Context, older_than: str, dry_run: bool) -> None:
+    """Remove old snapshots from the catalog, keeping the latest per table."""
+    cfg: PipelineConfig = ctx.obj["cfg"]
+    output: str = ctx.obj["output"]
+
+    from conduit_etl.core.models import parse_duration
+    try:
+        cutoff_delta = parse_duration(older_than)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    try:
+        cat = _make_catalog(cfg)
+        from datetime import datetime as _dt
+        cutoff = _dt.now() - cutoff_delta
+        result = _do_gc(cat, cutoff, dry_run=dry_run)
+        cat.close()
+    except ConduitError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    _emit(result, output)
+
+
+def _do_gc(catalog, cutoff: "datetime", *, dry_run: bool) -> dict:
+    from datetime import datetime
+    con = catalog.connection()
+
+    # Find all non-latest success run records older than cutoff
+    stale = con.execute(
+        """
+        SELECT id, step_name, snapshot_id, finished_at
+        FROM runs.run_records r
+        WHERE status = 'success'
+          AND finished_at < ?
+          AND snapshot_id IS NOT NULL
+          AND snapshot_id != (
+              SELECT snapshot_id FROM runs.run_records r2
+              WHERE r2.output_table = r.output_table AND r2.status = 'success'
+                AND r2.snapshot_id IS NOT NULL
+              ORDER BY r2.finished_at DESC LIMIT 1
+          )
+        """,
+        [cutoff],
+    ).fetchall()
+
+    if dry_run:
+        return {"dry_run": True, "would_delete": len(stale),
+                "records": [{"id": r[0], "step": r[1], "snapshot_id": r[2]} for r in stale]}
+
+    if stale:
+        ids = [r[0] for r in stale]
+        placeholders = ", ".join("?" * len(ids))
+        con.execute(f"DELETE FROM runs.run_records WHERE id IN ({placeholders})", ids)
+
+    return {"deleted": len(stale), "cutoff": str(cutoff)}

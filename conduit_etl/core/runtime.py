@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from concurrent.futures import FIRST_COMPLETED, wait as futures_wait
+from concurrent.futures import FIRST_COMPLETED, Future, wait as futures_wait
 from datetime import datetime
 from typing import Any
 
@@ -92,14 +92,18 @@ class Runtime:
                     results.setdefault(s.name, "skipped")
                 continue
 
-            futures = {
-                self.executor.submit(
-                    step,
-                    self._resolve_inputs(step, fp),
-                    input_snapshots=_extract_snapshots(fp),
-                ): (step, fp)
-                for step, fp in ready
-            }
+            futures = {}
+            for step, fp in ready:
+                if step.partition_by:
+                    partition_futures = self._submit_partitioned(step, fp)
+                    futures.update(partition_futures)
+                else:
+                    fut = self.executor.submit(
+                        step,
+                        self._resolve_inputs(step, fp),
+                        input_snapshots=_extract_snapshots(fp),
+                    )
+                    futures[fut] = (step, fp)
 
             pending = set(futures)
             while pending:
@@ -110,9 +114,19 @@ class Runtime:
                     try:
                         result = fut.result()
                     except Exception as exc:
+                        import traceback as _tb
                         err = exc if isinstance(exc, ExecutionError) else ExecutionError(step.name, str(exc), exc)
                         log.error("step %r failed: %s", step.name, err)
                         self._record(step, fp, status="failed", error=str(err), started_at=started_at)
+                        try:
+                            self.catalog.record_dead_letter(
+                                step_name=step.name,
+                                input_snapshot_ids=_extract_snapshots(fp),
+                                error=str(err),
+                                traceback=_tb.format_exc(),
+                            )
+                        except Exception:
+                            pass
                         results[step.name] = "failed"
                         continue
 
@@ -194,6 +208,36 @@ class Runtime:
             ready.append((step, fp))
         return ready
 
+    def _submit_partitioned(
+        self, step: Step, fp: dict[str, Any]
+    ) -> dict[Future, tuple[Step, dict]]:
+        """Fan-out: one sub-job per unique partition value, up to max_partitions."""
+        col = step.partition_by
+        inputs = self._resolve_inputs(step, fp)
+        if not inputs:
+            return {}
+
+        # Collect distinct partition values from the first input relation
+        first_rel = next(iter(inputs.values()))
+        try:
+            values = [r[0] for r in first_rel.aggregate(f"distinct {col} AS v").fetchall()]
+        except Exception:
+            # Column doesn't exist — fall back to non-partitioned
+            fut = self.executor.submit(step, inputs, input_snapshots=_extract_snapshots(fp))
+            return {fut: (step, fp)}
+
+        values = values[: step.max_partitions]
+        futures: dict[Future, tuple[Step, dict]] = {}
+        for val in values:
+            partition_inputs = {
+                name: rel.filter(f"{col} = '{val}'")
+                for name, rel in inputs.items()
+            }
+            partition_fp = {**fp, "__partition__": str(val)}
+            fut = self.executor.submit(step, partition_inputs, input_snapshots=_extract_snapshots(fp))
+            futures[fut] = (step, partition_fp)
+        return futures
+
     def _resolve_inputs(self, step: Step, fp: dict[str, Any]) -> dict:
         inputs = {}
         for name in step.input_names:
@@ -239,6 +283,20 @@ class Runtime:
             error=error,
         )
         self.catalog.record_run(record)
+
+
+def _merge_parquets(paths: list[str], staging_dir: str) -> str:
+    """Combine multiple parquet files from partition sub-jobs into one."""
+    import tempfile
+    import duckdb
+    from pathlib import Path
+
+    out = Path(staging_dir) / f"merged-{uuid.uuid4().hex}.parquet"
+    con = duckdb.connect()
+    quoted = ", ".join(f"'{p}'" for p in paths)
+    con.execute(f"COPY (SELECT * FROM read_parquet([{quoted}])) TO '{out}' (FORMAT PARQUET)")
+    con.close()
+    return str(out)
 
 
 def _extract_snapshots(fp: dict[str, Any]) -> dict[str, str]:

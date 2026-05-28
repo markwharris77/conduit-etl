@@ -25,16 +25,15 @@ _RESERVED = frozenset({"return", "self", "cls"})
 
 
 def _input_names(fn: Callable[..., Any]) -> list[str]:
-    """Parameter names whose annotation is Table (or missing) — these are DAG inputs."""
+    """Parameter names that are DAG inputs.
+
+    All parameters are treated as DAG inputs. Config and scheduling are
+    expressed through the decorator kwargs, never as function parameters.
+    If no producer exists for a parameter name, it is treated as an
+    external dependency and the DAG simply ignores it.
+    """
     sig = inspect.signature(fn)
-    names = []
-    for param_name, param in sig.parameters.items():
-        if param_name in _RESERVED:
-            continue
-        ann = param.annotation
-        if ann is inspect.Parameter.empty or ann is Table:
-            names.append(param_name)
-    return names
+    return [p for p in sig.parameters if p not in _RESERVED]
 
 
 def _fn_source(fn: Callable[..., Any]) -> str:

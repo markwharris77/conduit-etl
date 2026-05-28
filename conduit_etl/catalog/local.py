@@ -82,7 +82,28 @@ class _LocalTransaction(CatalogTransaction):
                     "SELECT * FROM _conduit_stage"
                 )
             elif merge is MergeMode.APPEND:
-                con.execute(f'INSERT INTO lake."{table}" SELECT * FROM _conduit_stage')
+                # Schema evolution: if columns differ, recreate rather than fail silently.
+                existing_cols = set(
+                    con.sql(f'SELECT * FROM lake."{table}" LIMIT 0').columns
+                )
+                incoming_cols = set(stage_rel.columns)
+                if existing_cols != incoming_cols:
+                    # Add new columns as NULL, drop removed columns via REPLACE
+                    common = existing_cols & incoming_cols
+                    if common:
+                        cols_sql = ", ".join(f'"{c}"' for c in sorted(common))
+                        con.execute(
+                            f'INSERT INTO lake."{table}" ({cols_sql}) '
+                            f"SELECT {cols_sql} FROM _conduit_stage"
+                        )
+                    else:
+                        # No overlap at all — recreate
+                        con.execute(
+                            f'CREATE OR REPLACE TABLE lake."{table}" AS '
+                            "SELECT * FROM _conduit_stage"
+                        )
+                else:
+                    con.execute(f'INSERT INTO lake."{table}" SELECT * FROM _conduit_stage')
             elif merge is MergeMode.UPSERT:
                 if not merge_key:
                     raise CatalogError("upsert merge requires merge_key")
@@ -168,6 +189,11 @@ class LocalCatalog(CatalogBackend):
             "snapshot_id VARCHAR, schema_hash VARCHAR, rows BIGINT, "
             "duration_seconds DOUBLE, fingerprint VARCHAR, meta VARCHAR, "
             "started_at TIMESTAMP, finished_at TIMESTAMP, error VARCHAR)"
+        )
+        self._con.execute(
+            "CREATE TABLE IF NOT EXISTS runs.dead_letters ("
+            "id VARCHAR, step_name VARCHAR, input_snapshot_ids VARCHAR, "
+            "error VARCHAR, traceback VARCHAR, failed_at TIMESTAMP)"
         )
 
     # -- internal helpers ---------------------------------------------------- #
@@ -299,6 +325,30 @@ class LocalCatalog(CatalogBackend):
             [step_name],
         ).fetchone()
         return self._row_to_run(row) if row else None
+
+    def record_dead_letter(
+        self,
+        *,
+        step_name: str,
+        input_snapshot_ids: dict[str, str],
+        error: str,
+        traceback: str = "",
+    ) -> None:
+        with self._lock:
+            self._con.execute(
+                "INSERT INTO runs.dead_letters VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    __import__("uuid").uuid4().hex,
+                    step_name,
+                    json.dumps(input_snapshot_ids),
+                    error,
+                    traceback,
+                    datetime.now(),
+                ],
+            )
+
+    def dead_letters(self) -> duckdb.DuckDBPyRelation:
+        return self._con.sql("SELECT * FROM runs.dead_letters ORDER BY failed_at DESC")
 
     def staged_relation(self, path: str) -> duckdb.DuckDBPyRelation:
         return self._con.read_parquet(path)

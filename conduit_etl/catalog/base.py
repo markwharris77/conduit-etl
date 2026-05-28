@@ -96,5 +96,19 @@ class CatalogBackend(ABC):
     def tables(self) -> list[str]:
         """Names of all data tables known to the catalog."""
 
+    def record_dead_letter(
+        self,
+        *,
+        step_name: str,
+        input_snapshot_ids: dict[str, str],
+        error: str,
+        traceback: str = "",
+    ) -> None:
+        """Persist a failed execution to the dead-letter table."""
+
+    def dead_letters(self) -> duckdb.DuckDBPyRelation:
+        """Return all dead-letter records as a DuckDB relation."""
+        ...
+
     def close(self) -> None:  # pragma: no cover - trivial default
         """Release any resources. Default no-op."""
