@@ -21,8 +21,15 @@ class ExecutorBackend(ABC):
         self,
         step: Step,
         input_relations: dict[str, duckdb.DuckDBPyRelation],
+        *,
+        input_snapshots: dict[str, str] | None = None,
     ) -> Future[StepResult]:
-        """Execute a step. Returns a Future for the staging result."""
+        """Execute a step. Returns a Future for the staging result.
+
+        ``input_snapshots`` maps table name → snapshot_id for distributed
+        executors that hand off work to remote workers (who re-read from the
+        catalog). Local executors may ignore it.
+        """
 
     @abstractmethod
     def shutdown(self, wait: bool = True) -> None: ...

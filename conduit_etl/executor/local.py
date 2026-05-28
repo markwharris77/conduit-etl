@@ -35,6 +35,8 @@ class LocalExecutor(ExecutorBackend):
         self,
         step: Step,
         input_relations: dict[str, duckdb.DuckDBPyRelation],
+        *,
+        input_snapshots: dict[str, str] | None = None,
     ) -> Future[StepResult]:
         with self._lock:
             self._active += 1

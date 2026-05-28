@@ -58,11 +58,14 @@ class Runtime:
         """Run all due steps once. Returns {step_name: status} for every step visited."""
         return self.tick()
 
-    def run_forever(self) -> None:
+    def run_forever(self, on_tick: Any = None) -> None:
+        """Loop forever, calling ``on_tick()`` after each tick if provided."""
         log.info("conduit scheduler started (tick=%.1fs)", self.tick_interval)
         try:
             while True:
                 self.tick()
+                if on_tick is not None:
+                    on_tick()
                 time.sleep(self.tick_interval)
         except KeyboardInterrupt:
             log.info("conduit scheduler stopping")
@@ -90,7 +93,11 @@ class Runtime:
                 continue
 
             futures = {
-                self.executor.submit(step, self._resolve_inputs(step)): (step, fp)
+                self.executor.submit(
+                    step,
+                    self._resolve_inputs(step, fp),
+                    input_snapshots=_extract_snapshots(fp),
+                ): (step, fp)
                 for step, fp in ready
             }
 
@@ -187,12 +194,22 @@ class Runtime:
             ready.append((step, fp))
         return ready
 
-    def _resolve_inputs(self, step: Step) -> dict:
+    def _resolve_inputs(self, step: Step, fp: dict[str, Any]) -> dict:
         inputs = {}
         for name in step.input_names:
             snap = self.catalog.latest_snapshot(name)
-            if snap is not None:
-                inputs[name] = self.catalog.as_relation(snap)
+            if snap is None:
+                continue
+            if step.incremental:
+                last = self.catalog.last_run(step.name, only_success=True)
+                if last and last.fingerprint.get(name) is not None:
+                    prev_snap_id = last.fingerprint[name][0]
+                    try:
+                        inputs[name] = self.catalog.new_rows_since(name, prev_snap_id)
+                        continue
+                    except Exception:
+                        pass  # fall through to full snapshot on error
+            inputs[name] = self.catalog.as_relation(snap)
         return inputs
 
     def _record(
@@ -222,3 +239,12 @@ class Runtime:
             error=error,
         )
         self.catalog.record_run(record)
+
+
+def _extract_snapshots(fp: dict[str, Any]) -> dict[str, str]:
+    """Pull table→snapshot_id pairs out of a fingerprint dict."""
+    return {
+        k: v[0]
+        for k, v in fp.items()
+        if not k.startswith("__") and isinstance(v, list) and len(v) >= 1
+    }

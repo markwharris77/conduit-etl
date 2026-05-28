@@ -42,13 +42,21 @@ def _make_catalog(cfg: PipelineConfig):
 
 
 def _make_queue(cfg: PipelineConfig):
+    backend = cfg.queue.backend
+    if backend == "sqlite":
+        from conduit_etl.queue.sqlite import SQLiteQueue
+        return SQLiteQueue(cfg.queue.path)
     from conduit_etl.queue.memory import MemoryQueue
     return MemoryQueue()
 
 
-def _make_executor(cfg: PipelineConfig):
-    from conduit_etl.executor.local import LocalExecutor
+def _make_executor(cfg: PipelineConfig, queue=None):
+    backend = cfg.executor.backend
     staging = cfg.executor.staging_path or cfg.steps.staging_path
+    if backend == "distributed":
+        from conduit_etl.executor.distributed import DistributedExecutor
+        return DistributedExecutor(queue=queue, staging_path=staging)
+    from conduit_etl.executor.local import LocalExecutor
     return LocalExecutor(workers=cfg.executor.workers, staging_path=staging)
 
 
@@ -59,7 +67,7 @@ def _make_runtime(cfg: PipelineConfig, *, tags=None, steps=None, tick_interval=N
 
     catalog = _make_catalog(cfg)
     queue = _make_queue(cfg)
-    executor = _make_executor(cfg)
+    executor = _make_executor(cfg, queue=queue)
     registry = get_registry()
 
     interval = tick_interval
@@ -74,7 +82,7 @@ def _make_runtime(cfg: PipelineConfig, *, tags=None, steps=None, tick_interval=N
         tick_interval=interval,
         tags=tags,
         step_names=steps,
-    ), catalog
+    ), catalog, queue, executor
 
 
 # --------------------------------------------------------------------------- #
@@ -139,7 +147,7 @@ def run(ctx: click.Context, steps: str | None, tag: str | None, pipeline: tuple[
     tags = [tag] if tag else None
 
     try:
-        runtime, catalog = _make_runtime(cfg, tags=tags, steps=step_names)
+        runtime, catalog, _queue, _executor = _make_runtime(cfg, tags=tags, steps=step_names)
         results = runtime.run_once()
         catalog.close()
     except ConduitError as exc:
@@ -159,9 +167,10 @@ def run(ctx: click.Context, steps: str | None, tag: str | None, pipeline: tuple[
 @main.command()
 @click.option("--pipeline", "-p", multiple=True, help="Python module(s) containing your pipeline steps")
 @click.option("--tick", default=None, help="Tick interval override (e.g. 30s)")
+@click.option("--port", default=None, type=int, help="HTTP API port (default: from config)")
 @click.pass_context
-def scheduler(ctx: click.Context, pipeline: tuple[str, ...], tick: str | None) -> None:
-    """Start the continuous scheduler daemon."""
+def scheduler(ctx: click.Context, pipeline: tuple[str, ...], tick: str | None, port: int | None) -> None:
+    """Start the continuous scheduler daemon with HTTP API."""
     cfg: PipelineConfig = ctx.obj["cfg"]
 
     for mod in pipeline:
@@ -176,11 +185,69 @@ def scheduler(ctx: click.Context, pipeline: tuple[str, ...], tick: str | None) -
         tick_interval = parse_duration(tick).total_seconds()
 
     try:
-        runtime, catalog = _make_runtime(cfg, tick_interval=tick_interval)
-        runtime.run_forever()
+        runtime, catalog, queue, executor = _make_runtime(cfg, tick_interval=tick_interval)
+
+        # Start the HTTP server when using distributed executor
+        from conduit_etl.executor.distributed import DistributedExecutor
+        if isinstance(executor, DistributedExecutor):
+            from conduit_etl.metrics.prometheus import MetricsRegistry
+            from conduit_etl.worker.server import SchedulerServer
+            metrics = MetricsRegistry()
+            srv = SchedulerServer(queue=queue, executor=executor, metrics=metrics)
+            srv.start(port=port or cfg.scheduler.port)
+            runtime.run_forever(on_tick=srv.increment_tick)
+            srv.stop()
+        else:
+            runtime.run_forever()
+
         catalog.close()
     except ConduitError as exc:
         raise click.ClickException(str(exc)) from exc
+
+
+# --------------------------------------------------------------------------- #
+# conduit worker
+# --------------------------------------------------------------------------- #
+
+@main.command()
+@click.option("--scheduler-url", default=None, help="Scheduler HTTP URL (e.g. http://host:7700)")
+@click.option("--pipeline", "-p", multiple=True, help="Python module(s) containing your pipeline steps")
+@click.option("--poll-interval", default=1.0, type=float, help="Seconds between job polls")
+@click.pass_context
+def worker(ctx: click.Context, scheduler_url: str | None, pipeline: tuple[str, ...], poll_interval: float) -> None:
+    """Start a worker process that polls the scheduler for jobs."""
+    cfg: PipelineConfig = ctx.obj["cfg"]
+
+    for mod in pipeline:
+        try:
+            importlib.import_module(mod)
+        except ImportError as exc:
+            raise click.ClickException(f"cannot import pipeline module {mod!r}: {exc}") from exc
+
+    url = scheduler_url or cfg.executor.scheduler_url
+    if not url:
+        raise click.ClickException(
+            "scheduler URL required: pass --scheduler-url or set executor.scheduler_url in config"
+        )
+
+    from conduit_etl.core.registry import get_registry
+    from conduit_etl.worker.process import WorkerProcess
+
+    staging = cfg.executor.staging_path or cfg.steps.staging_path
+    catalog = _make_catalog(cfg)
+    registry = get_registry()
+
+    wp = WorkerProcess(
+        scheduler_url=url,
+        registry=registry,
+        catalog=catalog,
+        staging_path=staging,
+        poll_interval=poll_interval,
+    )
+    try:
+        wp.run()
+    finally:
+        catalog.close()
 
 
 # --------------------------------------------------------------------------- #
@@ -227,7 +294,7 @@ def status(ctx: click.Context, pipeline: tuple[str, ...]) -> None:
         _emit(rows, output)
     else:
         if not rows:
-            click.echo("No steps registered.")
+            click.echo("No steps registered (pass --pipeline to load your pipeline).")
             return
         header = f"{'STEP':<30} {'KIND':<8} {'SCHEDULE':<12} {'STATUS':<10} {'LAST RUN':<22} {'ROWS':>8}"
         click.echo(header)
@@ -321,3 +388,69 @@ def debug(ctx: click.Context, at: str | None) -> None:
             click.echo(f"Error: {exc}", err=True)
 
     catalog.close()
+
+
+# --------------------------------------------------------------------------- #
+# conduit invalidate
+# --------------------------------------------------------------------------- #
+
+@main.command()
+@click.argument("step_name")
+@click.option("--cascade", is_flag=True, default=False, help="Also invalidate all downstream steps")
+@click.option("--pipeline", "-p", multiple=True, help="Python module(s) containing your pipeline steps")
+@click.pass_context
+def invalidate(ctx: click.Context, step_name: str, cascade: bool, pipeline: tuple[str, ...]) -> None:
+    """Force a step (and optionally its downstream steps) to re-run on next tick.
+
+    Invalidation works by deleting the most recent success run record for the
+    step, which causes the fingerprint check to treat it as never-run.
+    """
+    cfg: PipelineConfig = ctx.obj["cfg"]
+    output: str = ctx.obj["output"]
+
+    for mod in pipeline:
+        try:
+            importlib.import_module(mod)
+        except ImportError as exc:
+            raise click.ClickException(f"cannot import pipeline module {mod!r}: {exc}") from exc
+
+    try:
+        catalog = _make_catalog(cfg)
+        invalidated = _do_invalidate(step_name, cascade, catalog)
+        catalog.close()
+    except ConduitError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    _emit({"invalidated": invalidated}, output)
+
+
+def _do_invalidate(step_name: str, cascade: bool, catalog) -> list[str]:
+    """Delete run records so the step appears as never-run. Returns invalidated names."""
+    con = catalog.connection()
+    invalidated = [step_name]
+
+    if cascade:
+        try:
+            from conduit_etl.core.registry import get_registry
+            from conduit_etl.core.dag import build_dag
+            steps = get_registry().all_steps()
+            if steps:
+                dag = build_dag(steps)
+                visited: set[str] = {step_name}
+                frontier = list(dag.get(step_name, []))
+                while frontier:
+                    s = frontier.pop(0)
+                    if s not in visited:
+                        visited.add(s)
+                        invalidated.append(s)
+                        frontier.extend(dag.get(s, []))
+        except Exception:
+            pass
+
+    for name in invalidated:
+        con.execute(
+            "DELETE FROM runs.run_records WHERE step_name = ? AND status = 'success'",
+            [name],
+        )
+
+    return invalidated
