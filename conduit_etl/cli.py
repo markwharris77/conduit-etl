@@ -85,12 +85,15 @@ def _make_runtime(cfg: PipelineConfig, *, tags=None, steps=None, tick_interval=N
     if interval is None:
         interval = parse_duration(cfg.scheduler.tick).total_seconds()
 
+    heartbeat_window = parse_duration(cfg.scheduler.heartbeat_window).total_seconds()
+
     return Runtime(
         catalog=catalog,
         queue=queue,
         executor=executor,
         registry=registry,
         tick_interval=interval,
+        heartbeat_window=heartbeat_window,
         tags=tags,
         step_names=steps,
     ), catalog, queue, executor
@@ -198,19 +201,32 @@ def scheduler(ctx: click.Context, pipeline: tuple[str, ...], tick: str | None, p
     try:
         runtime, catalog, queue, executor = _make_runtime(cfg, tick_interval=tick_interval)
 
-        # Start the HTTP server when using distributed executor
-        from conduit_etl.executor.distributed import DistributedExecutor
-        if isinstance(executor, DistributedExecutor):
-            from conduit_etl.metrics.prometheus import MetricsRegistry
-            from conduit_etl.worker.server import SchedulerServer
-            metrics = MetricsRegistry()
-            srv = SchedulerServer(queue=queue, executor=executor, metrics=metrics)
-            srv.start(port=port or cfg.scheduler.port)
-            runtime.run_forever(on_tick=srv.increment_tick)
-            srv.stop()
-        else:
-            runtime.run_forever()
+        from conduit_etl.metrics.prometheus import MetricsRegistry
+        from conduit_etl.worker.metrics_server import MetricsServer
+        metrics = MetricsRegistry()
 
+        # Always start the metrics/health server.
+        metrics_srv = MetricsServer(queue=queue, metrics=metrics)
+        metrics_srv.start(port=cfg.scheduler.metrics_port)
+
+        # Start the job-coordination API only when using the distributed executor.
+        from conduit_etl.executor.distributed import DistributedExecutor
+        job_srv = None
+        if isinstance(executor, DistributedExecutor):
+            from conduit_etl.worker.server import SchedulerServer
+            job_srv = SchedulerServer(queue=queue, executor=executor, metrics=metrics)
+            job_srv.start(port=port or cfg.scheduler.port)
+
+        def _on_tick():
+            metrics_srv.increment_tick()
+            if job_srv:
+                job_srv.increment_tick()
+
+        runtime.run_forever(on_tick=_on_tick)
+
+        metrics_srv.stop()
+        if job_srv:
+            job_srv.stop()
         catalog.close()
     except ConduitError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -549,14 +565,10 @@ def replay(ctx: click.Context, step_name: str, run_id: str | None, pipeline: tup
 
         # Find the run to replay
         if run_id:
-            con = catalog.connection()
-            row = con.execute(
-                "SELECT fingerprint FROM runs.run_records WHERE id = ?", [run_id]
-            ).fetchone()
-            if row is None:
+            run = catalog.get_run_by_id(run_id)
+            if run is None:
                 raise click.ClickException(f"run {run_id!r} not found")
-            import json as _json
-            fp = _json.loads(row[0])
+            fp = run.fingerprint
         else:
             last = catalog.last_run(step_name, only_success=True)
             if last is None:
@@ -626,9 +638,8 @@ def backfill(ctx: click.Context, step_name: str, date_str: str, pipeline: tuple[
             snap = catalog.latest_snapshot(name)
             if snap:
                 rel = catalog.as_relation(snap)
-                # If partition_by is set, filter to the requested date
                 if step.partition_by:
-                    rel = rel.filter(f"{step.partition_by} = '{date_str}'")
+                    rel = _filter_partition(rel, step.partition_by, date_str)
                 inputs[name] = rel
 
         staging = cfg.executor.staging_path or cfg.steps.staging_path
@@ -752,6 +763,35 @@ def catalog_gc(ctx: click.Context, older_than: str, dry_run: bool) -> None:
         raise click.ClickException(str(exc)) from exc
 
     _emit(result, output)
+
+
+def _filter_partition(rel, column: str, value: str):
+    """Filter a DuckDB relation on a partition column.
+
+    Detects the column's type and casts the value appropriately so the filter
+    works for VARCHAR, DATE, TIMESTAMP, INTEGER, and BIGINT columns.
+    """
+    col_types = dict(zip(rel.columns, [str(t) for t in rel.types]))
+    col_type = col_types.get(column, "VARCHAR").upper()
+
+    if col_type in ("DATE",):
+        return rel.filter(f"CAST({column} AS DATE) = CAST('{value}' AS DATE)")
+    if col_type in ("TIMESTAMP", "TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ"):
+        return rel.filter(f"CAST({column} AS DATE) = CAST('{value}' AS DATE)")
+    if col_type in ("INTEGER", "INT", "INT4", "INT2", "SMALLINT",
+                    "BIGINT", "INT8", "HUGEINT"):
+        # Partition value must be a valid integer
+        try:
+            int_val = int(value)
+        except ValueError as exc:
+            raise click.ClickException(
+                f"partition_by column {column!r} is {col_type} "
+                f"but date {value!r} is not a valid integer"
+            ) from exc
+        return rel.filter(f"{column} = {int_val}")
+    # Default: VARCHAR / unknown — use string equality with a parameterised literal
+    safe_value = value.replace("'", "''")
+    return rel.filter(f"{column} = '{safe_value}'")
 
 
 def _do_gc(catalog, cutoff: "datetime", *, dry_run: bool) -> dict:

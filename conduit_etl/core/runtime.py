@@ -39,6 +39,7 @@ class Runtime:
         registry: Registry,
         *,
         tick_interval: float = 10.0,
+        heartbeat_window: float = 30.0,
         tags: list[str] | None = None,
         step_names: list[str] | None = None,
     ) -> None:
@@ -47,6 +48,7 @@ class Runtime:
         self.executor = executor
         self.registry = registry
         self.tick_interval = tick_interval
+        self.heartbeat_window = heartbeat_window
         self._filter_tags = set(tags or [])
         self._filter_names = set(step_names or [])
 
@@ -77,6 +79,11 @@ class Runtime:
     # ---------------------------------------------------------------------- #
 
     def tick(self) -> dict[str, str]:
+        # Reclaim jobs whose workers have gone silent before deciding what to run.
+        requeued = self.queue.requeue_stale(int(self.heartbeat_window))
+        if requeued:
+            log.info("requeued %d stale job(s)", requeued)
+
         now = datetime.now()
         steps = self._filtered_steps()
         if not steps:
@@ -251,8 +258,12 @@ class Runtime:
                     try:
                         inputs[name] = self.catalog.new_rows_since(name, prev_snap_id)
                         continue
-                    except Exception:
-                        pass  # fall through to full snapshot on error
+                    except Exception as exc:
+                        log.warning(
+                            "step %r: incremental new_rows_since failed for %r "
+                            "(falling back to full snapshot): %s",
+                            step.name, name, exc,
+                        )
             inputs[name] = self.catalog.as_relation(snap)
         return inputs
 

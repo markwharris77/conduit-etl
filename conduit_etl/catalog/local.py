@@ -326,6 +326,13 @@ class LocalCatalog(CatalogBackend):
         ).fetchone()
         return self._row_to_run(row) if row else None
 
+    def get_run_by_id(self, run_id: str) -> RunRecord | None:
+        row = self._con.execute(
+            f"SELECT {', '.join(_RUN_COLUMNS)} FROM runs.run_records WHERE id = ?",
+            [run_id],
+        ).fetchone()
+        return self._row_to_run(row) if row else None
+
     def record_dead_letter(
         self,
         *,

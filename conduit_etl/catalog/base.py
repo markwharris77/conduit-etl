@@ -85,6 +85,10 @@ class CatalogBackend(ABC):
         """The most recent run record for a step, optionally only successes."""
 
     @abstractmethod
+    def get_run_by_id(self, run_id: str) -> RunRecord | None:
+        """Fetch a specific run record by its ID."""
+
+    @abstractmethod
     def staged_relation(self, path: str) -> duckdb.DuckDBPyRelation:
         """Read a staging parquet file into a relation on the catalog connection."""
 
