@@ -1,0 +1,51 @@
+ident,name,type,latitude_deg,longitude_deg,elevation_ft,iso_country,iso_region,municipality,iata_code
+EGLL,Heathrow Airport,large_airport,51.4775,-0.461389,83,GB,GB-ENG,London,LHR
+EDDF,Frankfurt am Main Airport,large_airport,50.0264,8.54313,364,DE,DE-HE,Frankfurt am Main,FRA
+LFPG,Charles de Gaulle International Airport,large_airport,49.0128,2.54999,392,FR,FR-IDF,Paris,CDG
+EHAM,Amsterdam Airport Schiphol,large_airport,52.3086,4.76389,0,NL,NL-NH,Amsterdam,AMS
+LEMD,Adolfo Suárez Madrid–Barajas Airport,large_airport,40.4719,-3.56264,2000,ES,ES-MD,Madrid,MAD
+LIRF,Rome Fiumicino Airport,large_airport,41.8003,12.2389,13,IT,IT-62,Rome,FCO
+LSZH,Zürich Airport,large_airport,47.4647,8.54917,1416,CH,CH-ZH,Zürich,ZRH
+LOWW,Vienna International Airport,large_airport,48.1103,16.5697,600,AT,AT-9,Vienna,VIE
+EDDM,Munich Airport,large_airport,48.3538,11.7861,1487,DE,DE-BY,Munich,MUC
+EGKK,Gatwick Airport,large_airport,51.1481,-0.190278,202,GB,GB-ENG,London,LGW
+LFOB,Paris Beauvais Tillé Airport,medium_airport,49.4544,2.11278,359,FR,FR-HDF,Beauvais,BVA
+EBBR,Brussels Airport,large_airport,50.9014,4.48444,184,BE,BE-VBR,Brussels,BRU
+ENGM,Oslo Gardermoen Airport,large_airport,60.1939,11.1004,681,NO,NO-02,Oslo,OSL
+EKCH,Copenhagen Kastrup Airport,large_airport,55.6179,12.656,17,DK,DK-84,Copenhagen,CPH
+ESSA,Stockholm Arlanda Airport,large_airport,59.6519,17.9186,137,SE,SE-AB,Stockholm,ARN
+EFHK,Helsinki Vantaa Airport,large_airport,60.3172,24.9633,179,FI,FI-18,Helsinki,HEL
+LPPT,Humberto Delgado Airport,large_airport,38.7813,-9.13592,374,PT,PT-11,Lisbon,LIS
+LGAV,Athens Eleftherios Venizelos International Airport,large_airport,37.9364,23.9445,308,GR,GR-I,Athens,ATH
+LCLK,Larnaka International Airport,large_airport,34.875,33.6249,8,CY,CY-04,Larnaca,LCA
+LTBA,Istanbul Atatürk Airport,large_airport,40.9769,28.8146,163,TR,TR-34,Istanbul,IST
+LTFM,Istanbul Airport,large_airport,41.2753,28.7519,325,TR,TR-34,Istanbul,IST
+UUEE,Sheremetyevo International Airport,large_airport,55.9726,37.4146,630,RU,RU-MOS,Moscow,SVO
+UKBB,Boryspil International Airport,large_airport,50.345,30.8947,427,UA,UA-32,Kyiv,KBP
+EPWA,Warsaw Chopin Airport,large_airport,52.1657,20.9671,362,PL,PL-MZ,Warsaw,WAW
+LKPR,Václav Havel Airport Prague,large_airport,50.1008,14.26,1247,CZ,CZ-PR,Prague,PRG
+LYBE,Belgrade Nikola Tesla Airport,large_airport,44.8184,20.3091,335,RS,RS-00,Belgrade,BEG
+LDZA,Zagreb Airport,large_airport,45.7429,16.0688,353,HR,HR-01,Zagreb,ZAG
+LBSF,Sofia Airport,large_airport,42.6967,23.4114,1742,BG,BG-22,Sofia,SOF
+LROP,Henri Coandă International Airport,large_airport,44.5711,26.085,314,RO,RO-IF,Bucharest,OTP
+LHBP,Budapest Ferenc Liszt International Airport,large_airport,47.4298,19.261,495,HU,HU-PE,Budapest,BUD
+LYBE,Belgrade Nikola Tesla Airport,large_airport,44.8184,20.3091,335,RS,RS-00,Belgrade,BEG
+EDDB,Berlin Brandenburg Airport,large_airport,52.3667,13.5033,151,DE,DE-BB,Berlin,BER
+EDDH,Hamburg Airport,large_airport,53.6304,9.98823,53,DE,DE-HH,Hamburg,HAM
+EDDL,Düsseldorf Airport,large_airport,51.2895,6.76678,147,DE,DE-NW,Düsseldorf,DUS
+EDDC,Dresden Airport,medium_airport,51.1328,13.7672,755,DE,DE-SN,Dresden,DRS
+EGCC,Manchester Airport,large_airport,53.3537,-2.27495,257,GB,GB-ENG,Manchester,MAN
+EGPF,Glasgow International Airport,large_airport,55.8719,-4.43306,26,GB,GB-SCT,Glasgow,GLA
+EGNT,Newcastle Airport,medium_airport,55.0375,-1.69167,266,GB,GB-ENG,Newcastle upon Tyne,NCL
+EICK,Cork Airport,medium_airport,51.8413,-8.49111,502,IE,IE-C,Cork,ORK
+EIDW,Dublin Airport,large_airport,53.4213,-6.27007,242,IE,IE-L,Dublin,DUB
+LEMG,Málaga-Costa del Sol Airport,large_airport,36.675,-4.49911,53,ES,ES-AN,Málaga,AGP
+LEBL,Barcelona El Prat Airport,large_airport,41.2971,2.07846,12,ES,ES-CT,Barcelona,BCN
+LIML,Milan Linate Airport,large_airport,45.4451,9.27674,353,IT,IT-25,Milan,LIN
+LIPZ,Venice Marco Polo Airport,large_airport,45.5053,12.3519,7,IT,IT-34,Venice,VCE
+LMML,Malta International Airport,medium_airport,35.8574,14.4775,300,MT,MT-21,Luqa,MLA
+GCFV,Fuerteventura Airport,medium_airport,28.4527,-13.8638,85,ES,ES-CN,Puerto del Rosario,FUE
+GCTS,Tenerife South Airport,large_airport,28.0445,-16.5725,209,ES,ES-CN,Granadilla de Abona,TFS
+LPFR,Faro Airport,medium_airport,37.0144,-7.96591,24,PT,PT-08,Faro,FAO
+LEAL,Alicante-Elche Miguel Hernández Airport,large_airport,38.2822,-0.558156,142,ES,ES-VC,Alicante,ALC
+EGSS,London Stansted Airport,large_airport,51.885,0.235,348,GB,GB-ENG,London,STN

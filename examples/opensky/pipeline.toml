@@ -1,0 +1,26 @@
+[catalog]
+backend = "local"
+path    = "./.conduit/catalog"
+
+[queue]
+backend = "memory"
+
+[executor]
+backend      = "local"
+workers      = 4
+staging_path = "/tmp/conduit-opensky/staging"
+
+[scheduler]
+port             = 7700
+metrics_port     = 7701
+tick             = "30s"
+heartbeat_window = "60s"
+
+[steps]
+default_timeout = "2m"
+default_retry   = 1
+staging_path    = "/tmp/conduit-opensky/staging"
+
+[monitoring]
+log_level  = "info"
+log_format = "text"
