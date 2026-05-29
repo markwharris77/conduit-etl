@@ -1,6 +1,6 @@
 [project]
 name = "conduit-etl"
-version = "0.1.0"
+dynamic = ["version"]
 description = "A lightweight Python pipeline runtime for data engineering teams who cannot or will not use cloud-managed services."
 requires-python = ">=3.12"
 license = { text = "Apache-2.0" }
@@ -29,12 +29,15 @@ all = ["confluent-kafka>=2.0", "psycopg[binary]>=3.1"]
 conduit = "conduit_etl.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/markharris/conduit-etl"
-Repository = "https://github.com/markharris/conduit-etl"
+Homepage = "https://github.com/markwharris77/conduit-etl"
+Repository = "https://github.com/markwharris77/conduit-etl"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["conduit_etl"]
