@@ -22,7 +22,7 @@ from conduit_etl.catalog.base import CatalogBackend
 from conduit_etl.core.dag import execution_order
 from conduit_etl.core.errors import ExecutionError
 from conduit_etl.core.fingerprint import compute_fingerprint, fingerprint_changed
-from conduit_etl.core.models import RunRecord, Step
+from conduit_etl.core.models import RunRecord, Step, StepKind
 from conduit_etl.core.registry import Registry
 from conduit_etl.executor.base import ExecutorBackend
 from conduit_etl.queue.base import QueueBackend
@@ -207,10 +207,14 @@ class Runtime:
                 log.debug("step %r: inputs not yet available", step.name)
                 continue
 
-            prev_fp = last.fingerprint if last else None
-            if not fingerprint_changed(prev_fp, fp):
-                log.debug("step %r: fingerprint unchanged, skipping", step.name)
-                continue
+            # Sources have no catalog inputs so their fingerprint only contains
+            # __fn_hash__, which never changes between runs. Skip the equality
+            # check for sources — the schedule gate is the only gate they need.
+            if step.kind is not StepKind.SOURCE:
+                prev_fp = last.fingerprint if last else None
+                if not fingerprint_changed(prev_fp, fp):
+                    log.debug("step %r: fingerprint unchanged, skipping", step.name)
+                    continue
 
             ready.append((step, fp))
         return ready
