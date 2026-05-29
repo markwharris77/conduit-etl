@@ -44,6 +44,7 @@ def _make_catalog(cfg: PipelineConfig):
             endpoint=cfg.catalog.endpoint,
             key=cfg.catalog.key,
             secret=cfg.catalog.secret,
+            region=cfg.catalog.region,
         )
     from conduit_etl.catalog.local import LocalCatalog
     return LocalCatalog(cfg.catalog.path)
@@ -206,7 +207,7 @@ def scheduler(ctx: click.Context, pipeline: tuple[str, ...], tick: str | None, p
         metrics = MetricsRegistry()
 
         # Always start the metrics/health server.
-        metrics_srv = MetricsServer(queue=queue, metrics=metrics)
+        metrics_srv = MetricsServer(queue=queue, metrics=metrics, executor=executor)
         metrics_srv.start(port=cfg.scheduler.metrics_port)
 
         # Start the job-coordination API only when using the distributed executor.
@@ -391,18 +392,26 @@ def debug(ctx: click.Context, at: str | None) -> None:
 
     if not hasattr(catalog, "connection"):
         raise click.ClickException(
-            "conduit debug requires a LocalCatalog backend (local DuckDB connection). "
-            "For S3 or remote backends, connect to the catalog directly."
+            "conduit debug requires a catalog with a local DuckDB connection. "
+            "LocalCatalog and S3Catalog both support this; other backends do not."
         )
 
     con = catalog.connection()
     if at:
         click.echo(f"Note: time-travel to {at!r} — use AT (VERSION => N) syntax in queries.")
 
+    from conduit_etl.catalog.local import LocalCatalog
+    if isinstance(catalog, LocalCatalog):
+        run_table = "runs.run_records"
+        dead_table = "runs.dead_letters"
+    else:
+        run_table = "run_records"
+        dead_table = "dead_letters"
+
     click.echo("conduit debug — DuckDB shell.")
-    click.echo("  Tables:     SELECT * FROM lake.<table_name>")
-    click.echo("  Run log:    SELECT * FROM runs.run_records ORDER BY finished_at DESC LIMIT 20")
-    click.echo("  Dead letters: SELECT * FROM runs.dead_letters")
+    click.echo("  Tables:       SELECT * FROM lake.<table_name>")
+    click.echo(f"  Run log:      SELECT * FROM {run_table} ORDER BY finished_at DESC LIMIT 20")
+    click.echo(f"  Dead letters: SELECT * FROM {dead_table}")
     click.echo("  Time-travel:  SELECT * FROM lake.<table> AT (VERSION => N)")
     click.echo("Type .quit or Ctrl-D to exit.\n")
 
@@ -579,16 +588,22 @@ def replay(ctx: click.Context, step_name: str, run_id: str | None, pipeline: tup
                 raise click.ClickException(f"no successful run found for {step_name!r}")
             fp = last.fingerprint
 
-        # Resolve inputs from fingerprint snapshot IDs
+        # Resolve inputs from fingerprint snapshot IDs — use the specific snapshot
+        # from that run so replay is deterministic, not just "latest".
         inputs = {}
         for name in step.input_names:
             entry = fp.get(name)
             if entry and isinstance(entry, list):
                 from conduit_etl.core.models import Snapshot
+                from datetime import datetime as _dt
                 snap_id = entry[0]
-                snap = catalog.latest_snapshot(name)
-                if snap:
-                    inputs[name] = catalog.as_relation(snap)
+                stub = Snapshot(id=snap_id, table=name, created_at=_dt.now(), rows=0, schema_hash="")
+                try:
+                    inputs[name] = catalog.as_relation(stub)
+                except Exception:
+                    snap = catalog.latest_snapshot(name)
+                    if snap:
+                        inputs[name] = catalog.as_relation(snap)
 
         staging = cfg.executor.staging_path or cfg.steps.staging_path
         executor = LocalExecutor(workers=1, staging_path=staging)

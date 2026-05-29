@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from conduit_etl.executor.base import ExecutorBackend
     from conduit_etl.metrics.prometheus import MetricsRegistry
     from conduit_etl.queue.base import QueueBackend
 
@@ -52,9 +53,15 @@ class _MetricsHandler(BaseHTTPRequestHandler):
 class MetricsServer:
     """Minimal HTTP server exposing /health and /metrics on ``metrics_port``."""
 
-    def __init__(self, queue: QueueBackend, metrics: MetricsRegistry) -> None:
+    def __init__(
+        self,
+        queue: QueueBackend,
+        metrics: MetricsRegistry,
+        executor: ExecutorBackend | None = None,
+    ) -> None:
         self._queue = queue
         self._metrics = metrics
+        self._executor = executor
         self._tick_count = 0
         self._lock = threading.Lock()
         self._httpd: ThreadingHTTPServer | None = None
@@ -76,12 +83,16 @@ class MetricsServer:
 
     def handle_health(self) -> str:
         import json
+        workers = self._executor.active_count if self._executor is not None else 0
         return json.dumps({
             "status": "ok",
+            "workers": workers,
             "queue_depth": self._queue.pending_count(),
             "tick_count": self._tick_count,
         })
 
     def handle_metrics(self) -> str:
+        workers = self._executor.active_count if self._executor is not None else 0
         self._metrics.queue_depth.set(float(self._queue.pending_count()))
+        self._metrics.worker_active.set(float(workers))
         return self._metrics.render()

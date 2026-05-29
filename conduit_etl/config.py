@@ -43,6 +43,7 @@ class CatalogConfig:
     endpoint: str = ""
     key: str = ""
     secret: str = ""
+    region: str = "us-east-1"
 
 
 @dataclass

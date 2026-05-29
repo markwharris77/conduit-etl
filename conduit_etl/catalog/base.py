@@ -7,13 +7,66 @@ code only ever talks to this abstract interface, never a concrete backend.
 
 from __future__ import annotations
 
+import tempfile
 from abc import ABC, abstractmethod
 from datetime import datetime
+from pathlib import Path
 from types import TracebackType
 
 import duckdb
 
-from conduit_etl.core.models import RunRecord, Snapshot
+from conduit_etl.core.errors import CatalogError
+from conduit_etl.core.models import MergeMode, RunRecord, Snapshot
+
+
+def write_relation_to_lake(
+    con: duckdb.DuckDBPyConnection,
+    table: str,
+    relation: duckdb.DuckDBPyRelation,
+    merge: MergeMode,
+    merge_key: list[str] | None,
+    table_exists: bool,
+) -> None:
+    """Write ``relation`` into the DuckLake table ``table`` under ``con``.
+
+    This is the shared write path for both LocalCatalog and S3Catalog. It
+    materialises ``relation`` to a temp parquet file first to avoid cross-
+    connection restrictions, then performs the requested merge strategy.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+        tmp_path = tmp.name
+    relation.write_parquet(tmp_path)
+    stage_rel = con.read_parquet(tmp_path)
+    con.register("_conduit_stage", stage_rel)
+    try:
+        if merge is MergeMode.REPLACE or not table_exists:
+            con.execute(f'CREATE OR REPLACE TABLE lake."{table}" AS SELECT * FROM _conduit_stage')
+        elif merge is MergeMode.APPEND:
+            existing_cols = set(con.sql(f'SELECT * FROM lake."{table}" LIMIT 0').columns)
+            incoming_cols = set(stage_rel.columns)
+            if existing_cols != incoming_cols:
+                common = existing_cols & incoming_cols
+                if common:
+                    cols_sql = ", ".join(f'"{c}"' for c in sorted(common))
+                    con.execute(
+                        f'INSERT INTO lake."{table}" ({cols_sql}) '
+                        f"SELECT {cols_sql} FROM _conduit_stage"
+                    )
+                else:
+                    con.execute(
+                        f'CREATE OR REPLACE TABLE lake."{table}" AS SELECT * FROM _conduit_stage'
+                    )
+            else:
+                con.execute(f'INSERT INTO lake."{table}" SELECT * FROM _conduit_stage')
+        elif merge is MergeMode.UPSERT:
+            if not merge_key:
+                raise CatalogError("upsert merge requires merge_key")
+            on = " AND ".join(f't."{k}" = s."{k}"' for k in merge_key)
+            con.execute(f'DELETE FROM lake."{table}" AS t USING _conduit_stage AS s WHERE {on}')
+            con.execute(f'INSERT INTO lake."{table}" SELECT * FROM _conduit_stage')
+    finally:
+        con.unregister("_conduit_stage")
+        Path(tmp_path).unlink(missing_ok=True)
 
 
 class CatalogTransaction(ABC):

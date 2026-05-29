@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import re
-import tempfile
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +21,7 @@ from types import TracebackType
 
 import duckdb
 
-from conduit_etl.catalog.base import CatalogBackend, CatalogTransaction
+from conduit_etl.catalog.base import CatalogBackend, CatalogTransaction, write_relation_to_lake
 from conduit_etl.core.errors import CatalogError, SnapshotNotFoundError
 from conduit_etl.core.models import MergeMode, RunRecord, Snapshot
 from conduit_etl.core.fingerprint import schema_hash
@@ -65,58 +64,12 @@ class _LocalTransaction(CatalogTransaction):
         _check_ident(table)
         con = self._catalog._con
         merge = MergeMode(meta.get("merge", MergeMode.REPLACE.value))
-        merge_key = meta.get("merge_key")
+        merge_key = [_check_ident(k) for k in meta["merge_key"]] if meta.get("merge_key") else None
 
-        # Relations from a foreign connection can't be registered directly.
-        # Materialise via a temp parquet file so the catalog connection can read it.
-        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
-            tmp_path = tmp.name
-        relation.write_parquet(tmp_path)
-        stage_rel = con.read_parquet(tmp_path)
-        con.register("_conduit_stage", stage_rel)
-        try:
-            exists = self._catalog._table_exists(table)
-            if merge is MergeMode.REPLACE or not exists:
-                con.execute(
-                    f'CREATE OR REPLACE TABLE lake."{table}" AS '
-                    "SELECT * FROM _conduit_stage"
-                )
-            elif merge is MergeMode.APPEND:
-                # Schema evolution: if columns differ, recreate rather than fail silently.
-                existing_cols = set(
-                    con.sql(f'SELECT * FROM lake."{table}" LIMIT 0').columns
-                )
-                incoming_cols = set(stage_rel.columns)
-                if existing_cols != incoming_cols:
-                    # Add new columns as NULL, drop removed columns via REPLACE
-                    common = existing_cols & incoming_cols
-                    if common:
-                        cols_sql = ", ".join(f'"{c}"' for c in sorted(common))
-                        con.execute(
-                            f'INSERT INTO lake."{table}" ({cols_sql}) '
-                            f"SELECT {cols_sql} FROM _conduit_stage"
-                        )
-                    else:
-                        # No overlap at all — recreate
-                        con.execute(
-                            f'CREATE OR REPLACE TABLE lake."{table}" AS '
-                            "SELECT * FROM _conduit_stage"
-                        )
-                else:
-                    con.execute(f'INSERT INTO lake."{table}" SELECT * FROM _conduit_stage')
-            elif merge is MergeMode.UPSERT:
-                if not merge_key:
-                    raise CatalogError("upsert merge requires merge_key")
-                keys = [_check_ident(k) for k in merge_key]
-                on = " AND ".join(f't."{k}" = s."{k}"' for k in keys)
-                con.execute(
-                    f'DELETE FROM lake."{table}" AS t '
-                    f"USING _conduit_stage AS s WHERE {on}"
-                )
-                con.execute(f'INSERT INTO lake."{table}" SELECT * FROM _conduit_stage')
-        finally:
-            con.unregister("_conduit_stage")
-            Path(tmp_path).unlink(missing_ok=True)
+        write_relation_to_lake(
+            con, table, relation, merge, merge_key,
+            table_exists=self._catalog._table_exists(table),
+        )
 
         rows = int(relation.aggregate("count(*) AS n").fetchone()[0])
         snap = Snapshot(

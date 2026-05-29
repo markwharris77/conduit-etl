@@ -19,15 +19,17 @@ Config example (pipeline.toml):
 from __future__ import annotations
 
 import json
+import logging
 import re
 import threading
 from datetime import datetime
-from pathlib import Path
 from types import TracebackType
 
 import duckdb
 
-from conduit_etl.catalog.base import CatalogBackend, CatalogTransaction
+log = logging.getLogger(__name__)
+
+from conduit_etl.catalog.base import CatalogBackend, CatalogTransaction, write_relation_to_lake
 from conduit_etl.core.errors import CatalogError, SnapshotNotFoundError
 from conduit_etl.core.fingerprint import schema_hash
 from conduit_etl.core.models import MergeMode, RunRecord, Snapshot
@@ -64,45 +66,12 @@ class _S3Transaction(CatalogTransaction):
         _check_ident(table)
         con = self._catalog._con
         merge = MergeMode(meta.get("merge", MergeMode.REPLACE.value))
-        merge_key = meta.get("merge_key")
+        merge_key = [_check_ident(k) for k in meta["merge_key"]] if meta.get("merge_key") else None
 
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
-            tmp_path = tmp.name
-        relation.write_parquet(tmp_path)
-        stage_rel = con.read_parquet(tmp_path)
-        con.register("_conduit_stage", stage_rel)
-        try:
-            exists = self._catalog._table_exists(table)
-            if merge is MergeMode.REPLACE or not exists:
-                con.execute(f'CREATE OR REPLACE TABLE lake."{table}" AS SELECT * FROM _conduit_stage')
-            elif merge is MergeMode.APPEND:
-                existing_cols = set(con.sql(f'SELECT * FROM lake."{table}" LIMIT 0').columns)
-                incoming_cols = set(stage_rel.columns)
-                if existing_cols != incoming_cols:
-                    common = existing_cols & incoming_cols
-                    if common:
-                        cols_sql = ", ".join(f'"{c}"' for c in sorted(common))
-                        con.execute(
-                            f'INSERT INTO lake."{table}" ({cols_sql}) '
-                            f"SELECT {cols_sql} FROM _conduit_stage"
-                        )
-                    else:
-                        con.execute(
-                            f'CREATE OR REPLACE TABLE lake."{table}" AS SELECT * FROM _conduit_stage'
-                        )
-                else:
-                    con.execute(f'INSERT INTO lake."{table}" SELECT * FROM _conduit_stage')
-            elif merge is MergeMode.UPSERT:
-                if not merge_key:
-                    raise CatalogError("upsert merge requires merge_key")
-                keys = [_check_ident(k) for k in merge_key]
-                on = " AND ".join(f't."{k}" = s."{k}"' for k in keys)
-                con.execute(f'DELETE FROM lake."{table}" AS t USING _conduit_stage AS s WHERE {on}')
-                con.execute(f'INSERT INTO lake."{table}" SELECT * FROM _conduit_stage')
-        finally:
-            con.unregister("_conduit_stage")
-            Path(tmp_path).unlink(missing_ok=True)
+        write_relation_to_lake(
+            con, table, relation, merge, merge_key,
+            table_exists=self._catalog._table_exists(table),
+        )
 
         rows = int(relation.aggregate("count(*) AS n").fetchone()[0])
         snap = Snapshot(
@@ -204,8 +173,8 @@ class S3Catalog(CatalogBackend):
                 self._con.execute(
                     f"INSERT INTO run_records SELECT * FROM read_parquet('{glob}')"
                 )
-        except Exception:
-            pass  # No runs yet or S3 not reachable — start fresh
+        except Exception as exc:
+            log.warning("s3 catalog: could not load existing run records from %s: %s", self._runs_prefix, exc)
 
     def _persist_run(self, record: RunRecord) -> None:
         """Write a single run record as a parquet file to S3."""
@@ -215,8 +184,8 @@ class S3Catalog(CatalogBackend):
                 f"COPY (SELECT * FROM run_records WHERE id = ?) TO '{dest}' (FORMAT PARQUET)",
                 [record.id],
             )
-        except Exception:
-            pass  # Best-effort — the in-memory table is the live source; S3 is for restart recovery
+        except Exception as exc:
+            log.warning("s3 catalog: failed to persist run %s to %s: %s", record.id, dest, exc)
 
     # ---------------------------------------------------------------------- #
     # Internal helpers
@@ -349,11 +318,10 @@ class S3Catalog(CatalogBackend):
                 )
 
     def delete_old_runs(self, cutoff: datetime, *, keep_latest_per_table: bool = True) -> int:
+        # DuckDB's .rowcount is always -1 for DML; count rows to delete first.
         with self._lock:
             if keep_latest_per_table:
-                n = self._con.execute(
-                    """
-                    DELETE FROM run_records
+                _stale_where = """
                     WHERE status = 'success'
                       AND finished_at < ?
                       AND snapshot_id IS NOT NULL
@@ -364,13 +332,18 @@ class S3Catalog(CatalogBackend):
                             AND r2.snapshot_id IS NOT NULL
                           ORDER BY r2.finished_at DESC LIMIT 1
                       )
-                    """,
-                    [cutoff],
-                ).rowcount
+                """
+                n = int(self._con.execute(
+                    "SELECT count(*) FROM run_records " + _stale_where, [cutoff]
+                ).fetchone()[0])
+                if n:
+                    self._con.execute("DELETE FROM run_records " + _stale_where, [cutoff])
             else:
-                n = self._con.execute(
-                    "DELETE FROM run_records WHERE finished_at < ?", [cutoff]
-                ).rowcount
+                n = int(self._con.execute(
+                    "SELECT count(*) FROM run_records WHERE finished_at < ?", [cutoff]
+                ).fetchone()[0])
+                if n:
+                    self._con.execute("DELETE FROM run_records WHERE finished_at < ?", [cutoff])
         return n
 
     def record_dead_letter(

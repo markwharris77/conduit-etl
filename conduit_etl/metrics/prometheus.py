@@ -105,6 +105,9 @@ class MetricsRegistry:
         self.queue_depth = Gauge(
             "conduit_etl_queue_depth", "Current jobs waiting in queue"
         )
+        self.worker_active = Gauge(
+            "conduit_etl_worker_active", "Currently active workers"
+        )
 
     def record_step(
         self,
@@ -127,6 +130,7 @@ class MetricsRegistry:
             self.pipeline_lag,
             self.catalog_snapshots,
             self.queue_depth,
+            self.worker_active,
         ]
         return "\n\n".join(m.render() for m in metrics) + "\n"
 
