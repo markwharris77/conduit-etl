@@ -64,7 +64,7 @@ uv pip install -e .
 Verify it worked:
 
 ```bash
-conduit --version
+conduit --help
 ```
 
 ---
