@@ -10,7 +10,6 @@ Usage:
 
 from __future__ import annotations
 
-import inspect
 import json
 import logging
 import threading
@@ -156,7 +155,6 @@ class WorkerProcess:
     def _run_step(self, step, input_relations: dict) -> StepResult:
         import time as _time
 
-        sig = inspect.signature(step.fn)
         kwargs = {name: input_relations[name] for name in step.input_names if name in input_relations}
         start = _time.monotonic()
 

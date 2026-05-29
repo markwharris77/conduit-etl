@@ -340,6 +340,39 @@ class S3Catalog(CatalogBackend):
         ).fetchall()
         return [r[0] for r in rows]
 
+    def invalidate_runs(self, step_names: list[str]) -> None:
+        with self._lock:
+            for name in step_names:
+                self._con.execute(
+                    "DELETE FROM run_records WHERE step_name = ? AND status = 'success'",
+                    [name],
+                )
+
+    def delete_old_runs(self, cutoff: datetime, *, keep_latest_per_table: bool = True) -> int:
+        with self._lock:
+            if keep_latest_per_table:
+                n = self._con.execute(
+                    """
+                    DELETE FROM run_records
+                    WHERE status = 'success'
+                      AND finished_at < ?
+                      AND snapshot_id IS NOT NULL
+                      AND snapshot_id != (
+                          SELECT snapshot_id FROM run_records r2
+                          WHERE r2.output_table = run_records.output_table
+                            AND r2.status = 'success'
+                            AND r2.snapshot_id IS NOT NULL
+                          ORDER BY r2.finished_at DESC LIMIT 1
+                      )
+                    """,
+                    [cutoff],
+                ).rowcount
+            else:
+                n = self._con.execute(
+                    "DELETE FROM run_records WHERE finished_at < ?", [cutoff]
+                ).rowcount
+        return n
+
     def record_dead_letter(
         self,
         *,

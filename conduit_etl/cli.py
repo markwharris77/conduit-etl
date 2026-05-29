@@ -389,11 +389,21 @@ def debug(ctx: click.Context, at: str | None) -> None:
     except ConduitError as exc:
         raise click.ClickException(str(exc)) from exc
 
+    if not hasattr(catalog, "connection"):
+        raise click.ClickException(
+            "conduit debug requires a LocalCatalog backend (local DuckDB connection). "
+            "For S3 or remote backends, connect to the catalog directly."
+        )
+
     con = catalog.connection()
     if at:
-        click.echo(f"Time-travel to {at!r} is not yet supported in Phase 1 — showing current state.")
+        click.echo(f"Note: time-travel to {at!r} — use AT (VERSION => N) syntax in queries.")
 
-    click.echo("conduit debug — DuckDB shell. Catalog attached as 'lake', run log as 'runs'.")
+    click.echo("conduit debug — DuckDB shell.")
+    click.echo("  Tables:     SELECT * FROM lake.<table_name>")
+    click.echo("  Run log:    SELECT * FROM runs.run_records ORDER BY finished_at DESC LIMIT 20")
+    click.echo("  Dead letters: SELECT * FROM runs.dead_letters")
+    click.echo("  Time-travel:  SELECT * FROM lake.<table> AT (VERSION => N)")
     click.echo("Type .quit or Ctrl-D to exit.\n")
 
     while True:
@@ -453,7 +463,6 @@ def invalidate(ctx: click.Context, step_name: str, cascade: bool, pipeline: tupl
 
 def _do_invalidate(step_name: str, cascade: bool, catalog) -> list[str]:
     """Delete run records so the step appears as never-run. Returns invalidated names."""
-    con = catalog.connection()
     invalidated = [step_name]
 
     if cascade:
@@ -474,12 +483,7 @@ def _do_invalidate(step_name: str, cascade: bool, catalog) -> list[str]:
         except Exception:
             pass
 
-    for name in invalidated:
-        con.execute(
-            "DELETE FROM runs.run_records WHERE step_name = ? AND status = 'success'",
-            [name],
-        )
-
+    catalog.invalidate_runs(invalidated)
     return invalidated
 
 
@@ -795,34 +799,36 @@ def _filter_partition(rel, column: str, value: str):
 
 
 def _do_gc(catalog, cutoff: "datetime", *, dry_run: bool) -> dict:
-    from datetime import datetime
-    con = catalog.connection()
-
-    # Find all non-latest success run records older than cutoff
-    stale = con.execute(
-        """
-        SELECT id, step_name, snapshot_id, finished_at
-        FROM runs.run_records r
-        WHERE status = 'success'
-          AND finished_at < ?
-          AND snapshot_id IS NOT NULL
-          AND snapshot_id != (
-              SELECT snapshot_id FROM runs.run_records r2
-              WHERE r2.output_table = r.output_table AND r2.status = 'success'
-                AND r2.snapshot_id IS NOT NULL
-              ORDER BY r2.finished_at DESC LIMIT 1
-          )
-        """,
-        [cutoff],
-    ).fetchall()
-
     if dry_run:
-        return {"dry_run": True, "would_delete": len(stale),
-                "records": [{"id": r[0], "step": r[1], "snapshot_id": r[2]} for r in stale]}
+        # For dry run: count what would be deleted via the run_log relation
+        rel = catalog.run_log()
+        cols = rel.columns
+        rows = rel.fetchall()
+        stale = []
+        # Find the latest snapshot_id per table
+        latest: dict[str, str] = {}
+        for row in rows:
+            data = dict(zip(cols, row))
+            tbl = data.get("output_table", "")
+            snap = data.get("snapshot_id")
+            status = data.get("status", "")
+            if status == "success" and snap and tbl not in latest:
+                latest[tbl] = snap
+        for row in rows:
+            data = dict(zip(cols, row))
+            finished = data.get("finished_at")
+            status = data.get("status", "")
+            snap = data.get("snapshot_id")
+            tbl = data.get("output_table", "")
+            if (
+                status == "success"
+                and snap
+                and finished
+                and finished < cutoff
+                and latest.get(tbl) != snap
+            ):
+                stale.append({"id": data.get("id"), "step": data.get("step_name"), "snapshot_id": snap})
+        return {"dry_run": True, "would_delete": len(stale), "records": stale}
 
-    if stale:
-        ids = [r[0] for r in stale]
-        placeholders = ", ".join("?" * len(ids))
-        con.execute(f"DELETE FROM runs.run_records WHERE id IN ({placeholders})", ids)
-
-    return {"deleted": len(stale), "cutoff": str(cutoff)}
+    deleted = catalog.delete_old_runs(cutoff, keep_latest_per_table=True)
+    return {"deleted": deleted, "cutoff": str(cutoff)}

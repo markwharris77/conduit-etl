@@ -357,6 +357,52 @@ class LocalCatalog(CatalogBackend):
     def dead_letters(self) -> duckdb.DuckDBPyRelation:
         return self._con.sql("SELECT * FROM runs.dead_letters ORDER BY failed_at DESC")
 
+    def invalidate_runs(self, step_names: list[str]) -> None:
+        with self._lock:
+            for name in step_names:
+                self._con.execute(
+                    "DELETE FROM runs.run_records WHERE step_name = ? AND status = 'success'",
+                    [name],
+                )
+
+    def delete_old_runs(self, cutoff: datetime, *, keep_latest_per_table: bool = True) -> int:
+        with self._lock:
+            if keep_latest_per_table:
+                _STALE_QUERY = """
+                    SELECT id FROM runs.run_records r
+                    WHERE status = 'success'
+                      AND finished_at < ?
+                      AND snapshot_id IS NOT NULL
+                      AND snapshot_id != (
+                          SELECT snapshot_id FROM runs.run_records r2
+                          WHERE r2.output_table = r.output_table
+                            AND r2.status = 'success'
+                            AND r2.snapshot_id IS NOT NULL
+                          ORDER BY r2.finished_at DESC LIMIT 1
+                      )
+                """
+                ids = [row[0] for row in self._con.execute(_STALE_QUERY, [cutoff]).fetchall()]
+                if not ids:
+                    return 0
+                placeholders = ", ".join("?" * len(ids))
+                self._con.execute(
+                    f"DELETE FROM runs.run_records WHERE id IN ({placeholders})", ids
+                )
+                return len(ids)
+            else:
+                ids = [
+                    row[0] for row in self._con.execute(
+                        "SELECT id FROM runs.run_records WHERE finished_at < ?", [cutoff]
+                    ).fetchall()
+                ]
+                if not ids:
+                    return 0
+                placeholders = ", ".join("?" * len(ids))
+                self._con.execute(
+                    f"DELETE FROM runs.run_records WHERE id IN ({placeholders})", ids
+                )
+                return len(ids)
+
     def staged_relation(self, path: str) -> duckdb.DuckDBPyRelation:
         return self._con.read_parquet(path)
 

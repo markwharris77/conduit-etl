@@ -2,10 +2,6 @@
 
 Requires the ``kafka`` extra: ``pip install conduit-etl[kafka]``.
 
-The decorated source function receives a list of messages (as dicts) and should
-return a DuckDB relation. The consumer group offset is committed after each
-successful catalog write, giving at-least-once delivery semantics.
-
 Example:
 
     from conduit_etl import source, Table
@@ -18,10 +14,13 @@ Example:
 
 from __future__ import annotations
 
+import json
+import tempfile
+from pathlib import Path
 from typing import Any
 
 try:
-    from confluent_kafka import Consumer, KafkaException, TopicPartition  # type: ignore[import]
+    from confluent_kafka import Consumer, KafkaException  # type: ignore[import]
     _KAFKA_AVAILABLE = True
 except ImportError:
     _KAFKA_AVAILABLE = False
@@ -46,12 +45,14 @@ def kafka_batch(
 ) -> Any:
     """Consume up to ``max_messages`` from ``topic`` and return as a DuckDB relation.
 
-    Returns a DuckDB relation with columns derived from the message values
-    (assumed to be JSON objects) plus ``_kafka_offset`` and ``_kafka_partition``.
+    Each message value is expected to be a JSON object. The relation will have
+    one column per JSON key, plus ``_kafka_offset`` and ``_kafka_partition``.
     Returns an empty relation if no messages are available.
+
+    Consumer group offsets are NOT committed here — commit them after the
+    catalog write succeeds to get at-least-once delivery semantics.
     """
     _require_kafka()
-    import json
     import duckdb
 
     consumer = Consumer({
@@ -83,9 +84,19 @@ def kafka_batch(
         consumer.close()
 
     if not records:
-        return duckdb.sql("SELECT 1 LIMIT 0")  # empty relation — caller must handle
+        return duckdb.sql("SELECT 1 LIMIT 0")
 
-    return duckdb.sql(
-        "SELECT * FROM (SELECT unnest(?) AS r) t",
-        # DuckDB doesn't support this directly; use read_json or create a table
-    )
+    # Write to a temp NDJSON file and read back — portable across DuckDB versions.
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".ndjson", delete=False, encoding="utf-8"
+    ) as f:
+        tmp = f.name
+        for record in records:
+            f.write(json.dumps(record, default=str) + "\n")
+
+    try:
+        rel = duckdb.read_json(tmp)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+    return rel

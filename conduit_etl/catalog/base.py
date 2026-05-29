@@ -51,7 +51,11 @@ class CatalogTransaction(ABC):
 
 
 class CatalogBackend(ABC):
-    """Abstract catalog backend."""
+    """Abstract catalog backend.
+
+    All methods marked ``@abstractmethod`` must be implemented by every backend.
+    Methods without the decorator have sensible defaults and may be overridden.
+    """
 
     @abstractmethod
     def transaction(self) -> CatalogTransaction: ...
@@ -100,6 +104,20 @@ class CatalogBackend(ABC):
     def tables(self) -> list[str]:
         """Names of all data tables known to the catalog."""
 
+    @abstractmethod
+    def invalidate_runs(self, step_names: list[str]) -> None:
+        """Delete success run records for the given steps (forces re-run on next tick)."""
+
+    @abstractmethod
+    def delete_old_runs(
+        self, cutoff: datetime, *, keep_latest_per_table: bool = True
+    ) -> int:
+        """Delete run records older than ``cutoff``. Returns count deleted."""
+
+    # ------------------------------------------------------------------ #
+    # Optional — backends may override for richer behaviour
+    # ------------------------------------------------------------------ #
+
     def record_dead_letter(
         self,
         *,
@@ -108,11 +126,20 @@ class CatalogBackend(ABC):
         error: str,
         traceback: str = "",
     ) -> None:
-        """Persist a failed execution to the dead-letter table."""
+        """Persist a failed execution to the dead-letter store.
+
+        Default implementation is a no-op. Override to enable dead-letter tracking.
+        """
 
     def dead_letters(self) -> duckdb.DuckDBPyRelation:
-        """Return all dead-letter records as a DuckDB relation."""
-        ...
+        """Return all dead-letter records as a DuckDB relation.
 
-    def close(self) -> None:  # pragma: no cover - trivial default
-        """Release any resources. Default no-op."""
+        Default returns an empty relation. Override if the backend stores dead letters.
+        """
+        return duckdb.sql(
+            "SELECT '' AS id, '' AS step_name, '' AS input_snapshot_ids, "
+            "'' AS error, '' AS traceback, CURRENT_TIMESTAMP AS failed_at LIMIT 0"
+        )
+
+    def close(self) -> None:
+        """Release any resources held by this backend."""
