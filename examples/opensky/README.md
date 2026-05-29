@@ -38,9 +38,34 @@ positions arrive.
 
 ## Requirements
 
-- conduit-etl installed (from the parent directory)
 - Python 3.12+
 - Internet access (OpenSky and OurAirports are public APIs)
+
+---
+
+## Installation
+
+From the repo root, install conduit-etl in editable mode:
+
+```bash
+cd /path/to/conduit-etl
+uv pip install -e .
+```
+
+Or create a clean virtual environment first:
+
+```bash
+cd /path/to/conduit-etl
+uv venv
+source .venv/bin/activate    # Windows: .venv\Scripts\activate
+uv pip install -e .
+```
+
+Verify it worked:
+
+```bash
+conduit --version
+```
 
 ---
 
