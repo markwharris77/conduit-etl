@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
+set -eu
 
 cd "$(dirname "$0")"
 export PYTHONPATH=.
